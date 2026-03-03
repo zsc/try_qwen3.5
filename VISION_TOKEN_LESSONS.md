@@ -88,3 +88,53 @@
 /home/zsc/Downloads/try_qwen3.5/.venv/bin/python /home/zsc/Downloads/try_qwen3.5/qwen35_image_token_curve.py
 ```
 
+## 10. Image token 的生成与“点位”（序列位置与 MRoPE）
+
+这一节回答两个问题：
+
+- 图像 token（`<|image_pad|>` 展开后的视觉 token）是怎么来的？
+- 这些 token 在输入序列里怎么插入？在位置编码里怎么“定位”（点位）？
+
+### 10.1 从图像到 `image_pad`（视觉 token）
+
+- 预处理：输入图 `(H,W)` 先走 `smart_resize` 得到有效尺寸 `(H',W')`。
+- 其中会发生：像素夹紧到 `[min_pixels,max_pixels]`、并把高宽对齐到 `factor = patch_size*merge_size` 的倍数（本实验为 `16*2=32`）。
+- Patch 网格：`grid_h = H'/patch_size`，`grid_w = W'/patch_size`。processor 返回的 `image_grid_thw` 本质上就是 `[T, grid_h, grid_w]`（单图通常 `T=1`）。
+- 空间 merge：视觉编码器先做 `16×16` patch embedding，然后把相邻 `merge_size×merge_size`（这里 `2×2`）patch token 合并成 1 个 LLM 视觉 token。
+- 视觉 token 数（`image_pad` 展开数量）：
+- `T_pad = (T*grid_h*grid_w)/(merge_size^2)`（单图 `T=1`）。
+- 在本实验配置下等价为：`T_pad = H'*W'/1024`（因为有效步长是 `32×32`）。
+- 若把边界也算进去：`T_total = T_pad + 2`（`vision_start/end` 各 1 个）。
+
+### 10.2 序列“点位”：这些 token 在 input_ids 里怎么排
+
+- Chat template 会把每张图放在 `vision_start`/`vision_end` 之间：`<|vision_start|><|image_pad|><|vision_end|>`。
+- processor 在编码时把那个单个 `<|image_pad|>` 展开成 `T_pad` 个 `image_token_id`，因此在 `input_ids` 中图像是一段连续区间。
+
+### 10.3 位置编码“点位”：MRoPE 的 3D position_ids
+
+Qwen3-VL 路线下的 RoPE 位置编码不是单路 1D，而是 3 路（可理解为对 `(t,h,w)` 三个轴分别做 rotary）：
+
+- 文本 token：三路 position 都是同一个递增的 1D 序号（等价于“在对角线上走”）。
+- 视觉 token：为视觉块分配 `(t_index,h_index,w_index)` 三个坐标。
+- 对图像：`t_index` 恒定（通常为 0），`h_index∈[0,llm_h)`、`w_index∈[0,llm_w)`，按 `w` 最快、再 `h` 的顺序展平。
+- 对视频：在当前实现里 LLM 侧 `llm_grid_t` 也被视为 1（注释里明确写了 temporal 信息用 timestamps 编码），因此这里的 `t_index` 同样恒定，主要靠 text/timestamp token 表达时间。
+
+### 10.4 token 索引如何对应到图像格子/区域
+
+设 LLM 侧网格宽为 `llm_w = grid_w/merge_size`，视觉 token 在该图像块内的索引为 `k = 0..T_pad-1`：
+
+- `w = k % llm_w`
+- `h = k // llm_w`
+
+在本实验配置（`patch_size=16, merge_size=2`）下，它对应 `smart_resize` 后图像上的一个 `32×32` 区域：
+
+- `x ∈ [w*32,(w+1)*32)`, `y ∈ [h*32,(h+1)*32)`
+
+### 10.5 一个可对照的例子
+
+以 `1920×1080` 为例：
+
+- processor 返回 `image_grid_thw = [1, 68, 120]`，对应 `H'=68*16=1088`、`W'=120*16=1920`。
+- LLM 侧网格：`llm_h=68/2=34`，`llm_w=120/2=60`。
+- `T_pad = 34*60 = 2040`，因此 `T_total = 2040 + 2`（如果把 `vision_start/end` 也计入视觉段总 token）。
