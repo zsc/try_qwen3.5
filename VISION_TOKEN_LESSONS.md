@@ -106,6 +106,18 @@
 - 在本实验配置下等价为：`T_pad = H'*W'/1024`（因为有效步长是 `32×32`）。
 - 若把边界也算进去：`T_total = T_pad + 2`（`vision_start/end` 各 1 个）。
 
+#### 10.1.1 `merge_size` 是空间 merge（H/W），不是 time merge
+
+- 计数公式里除的是 `merge_size^2`，而不是 `merge_size^3`：说明只合并二维空间网格（H/W），不合并 T 维。
+- 在 HF 的实现里，LLM 侧网格会显式写成 `llm_grid_h = h//spatial_merge_size`、`llm_grid_w = w//spatial_merge_size`，而 `t` 不做除法。
+- 直观含义：每个 LLM 视觉 token 覆盖 `(patch_size*merge_size)×(patch_size*merge_size)` 的像素区域（本实验为 `32×32`）。
+
+#### 10.1.2 “先切 patch 后 merge”发生在 token/feature map 上
+
+- patch embedding 把像素映射为 `patch_size=16` 粒度的 token 网格（可以类比 stride=16 的卷积投影）。
+- merge 在该 token 网格上把相邻 `2×2` token 合并成 1 个 token（常见实现是拼接后线性投影/池化一类的下采样），属于 feature map/token map 级别操作。
+- 这么做的动机：先用更细粒度提取局部特征，再用可学习的合并做降采样，通常比直接用更大 `patch_size` 一步到位更保信息。
+
 ### 10.2 序列“点位”：这些 token 在 input_ids 里怎么排
 
 - Chat template 会把每张图放在 `vision_start`/`vision_end` 之间：`<|vision_start|><|image_pad|><|vision_end|>`。
